@@ -131,6 +131,10 @@ pub fn calculate_backoff_delay(attempt: usize, config: &RetryConfig) -> Duration
 }
 
 /// Deliver a webhook payload to a single subscription with exponential backoff retries.
+#[tracing::instrument(
+    skip(client, subscription, payload, retry_config),
+    fields(subscription_id = %subscription.id, event = %payload.event)
+)]
 pub async fn deliver_webhook_payload(
     client: &reqwest::Client,
     subscription: &WebhookSubscription,

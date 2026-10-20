@@ -54,6 +54,8 @@
                 "deadline",
                 "id",
                 "reward",
+                "reward_decimals",
+                "reward_token",
                 "status",
                 "tags"
             ],

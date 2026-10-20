@@ -172,6 +172,11 @@ pub struct Bounty {
     pub created_at: DateTime<Utc>,
     /// Reward amount, mirrored from the contract's `Bounty::reward_amount`.
     pub reward: i128,
+    /// Contract token address and precision used to format the reward.
+    #[serde(default)]
+    pub reward_token: Option<String>,
+    #[serde(default = "default_reward_decimals")]
+    pub reward_decimals: u32,
     /// Optional expiry, mirrored from the contract's `Bounty::deadline`. `None`
     /// means the bounty never expires.
     pub deadline: Option<DateTime<Utc>>,
@@ -187,6 +192,10 @@ fn default_bounty_status() -> String {
     "open".to_string()
 }
 
+fn default_reward_decimals() -> u32 {
+    7
+}
+
 impl Default for Bounty {
     fn default() -> Self {
         Bounty {
@@ -195,6 +204,8 @@ impl Default for Bounty {
             assignee: None,
             created_at: DateTime::<Utc>::default(),
             reward: 0,
+            reward_token: None,
+            reward_decimals: default_reward_decimals(),
             deadline: None,
             status: default_bounty_status(),
             tags: Vec::new(),
@@ -241,6 +252,7 @@ pub struct BountyPage {
 /// max-limit clamp in `routes::bounties::list_bounties`); this function
 /// does not re-validate it.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(db, creator), fields(limit, sort = ?sort, order = ?order))]
 pub fn list_bounties_by_creator(
     db: &SharedDb,
     creator: &str,
@@ -263,6 +275,55 @@ pub fn list_bounties_by_creator(
         .collect();
     apply_sort(&mut matches, sort, order);
     paginate(matches, limit)
+}
+
+/// Return a sorted export window without cloning the complete matching set.
+/// The temporary selection is bounded by `offset + limit`, which the route
+/// caps before calling this function.
+#[allow(clippy::too_many_arguments)]
+pub fn list_bounties_export_page(
+    db: &SharedDb,
+    offset: usize,
+    limit: usize,
+    cursor: Option<DateTime<Utc>>,
+    status: Option<&str>,
+    tag: Option<&str>,
+    sort: BountySortField,
+    order: SortOrder,
+) -> Vec<Bounty> {
+    let target = offset.saturating_add(limit);
+    if target == 0 {
+        return Vec::new();
+    }
+
+    let guard = read_db(db);
+    let mut selected = Vec::with_capacity(target);
+    for (source_index, bounty) in guard.bounties.iter().enumerate() {
+        if cursor.is_some_and(|value| bounty.created_at >= value)
+            || status.is_some_and(|value| bounty.status != value)
+            || tag.is_some_and(|value| !bounty.tags.iter().any(|item| item == value))
+        {
+            continue;
+        }
+
+        let position = selected.partition_point(|(index, existing)| {
+            let comparison = compare_bounties(existing, bounty, sort, order);
+            comparison == std::cmp::Ordering::Less
+                || (comparison == std::cmp::Ordering::Equal && *index < source_index)
+        });
+        if position < target {
+            selected.insert(position, (source_index, bounty.clone()));
+            if selected.len() > target {
+                selected.pop();
+            }
+        }
+    }
+
+    selected
+        .into_iter()
+        .skip(offset)
+        .map(|(_, bounty)| bounty)
+        .collect()
 }
 
 /// List bounties where `assignee` matches the recorded assignee, newest-first
@@ -293,30 +354,38 @@ pub fn list_bounties_by_assignee(
 /// directions, so "soonest expiring first" lists never lead with non-expiring
 /// bounties.
 fn apply_sort(bounties: &mut [Bounty], sort: BountySortField, order: SortOrder) {
-    bounties.sort_by(|a, b| {
-        if sort == BountySortField::Deadline {
-            return match (a.deadline, b.deadline) {
-                (Some(x), Some(y)) => match order {
-                    SortOrder::Asc => x.cmp(&y),
-                    SortOrder::Desc => y.cmp(&x),
-                },
-                // Bounties without a deadline always trail those that have
-                // one, regardless of direction.
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            };
+    bounties.sort_by(|a, b| compare_bounties(a, b, sort, order));
+}
+
+fn compare_bounties(
+    left: &Bounty,
+    right: &Bounty,
+    sort: BountySortField,
+    order: SortOrder,
+) -> std::cmp::Ordering {
+    let primary = if sort == BountySortField::Deadline {
+        match (left.deadline, right.deadline) {
+            (Some(a), Some(b)) => match order {
+                SortOrder::Asc => a.cmp(&b),
+                SortOrder::Desc => b.cmp(&a),
+            },
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
         }
-        let ord = match sort {
-            BountySortField::Created => a.created_at.cmp(&b.created_at),
-            BountySortField::Reward => a.reward.cmp(&b.reward),
+    } else {
+        let value = match sort {
+            BountySortField::Created => left.created_at.cmp(&right.created_at),
+            BountySortField::Reward => left.reward.cmp(&right.reward),
             BountySortField::Deadline => unreachable!("handled above"),
         };
         match order {
-            SortOrder::Asc => ord,
-            SortOrder::Desc => ord.reverse(),
+            SortOrder::Asc => value,
+            SortOrder::Desc => value.reverse(),
         }
-    });
+    };
+
+    primary
 }
 
 /// Trim `bounties` to at most `limit` entries, returning the next cursor

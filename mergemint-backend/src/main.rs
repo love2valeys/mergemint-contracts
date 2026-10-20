@@ -102,8 +102,10 @@ mod webhooks;
 use db::{new_shared_db, new_shared_idempotency_store};
 use metrics::{metrics_router, track_metrics, Metrics};
 use routes::bounties::{
-    bounty_stream, claim_bounty, get_bounty_route, list_bounties, list_bounties_by_assignee,
+    bounty_stream, claim_bounty, export_bounties_csv, get_bounty_route, list_bounties,
+    list_bounties_by_assignee,
 };
+use routes::feed::open_bounties_feed;
 use routes::leaderboard::get_leaderboard_route;
 use routes::tx::{
     new_shared_rate_limiter, query_audit_logs, resolve_dispute, self_claim, AppState,
@@ -122,11 +124,7 @@ const REQUEST_TIMEOUT_SECS_DEFAULT: u64 = 30;
 
 /// The canonical header name used to carry the correlation ID across service
 /// boundaries.  Clients may supply their own value; if absent a UUID v4 is
-/// generated automatically by `SetRequestIdLayer`.
 const REQUEST_ID_HEADER: &str = "x-request-id";
-
-/// Address the HTTP server listens on.
-const LISTEN_ADDR: &str = "0.0.0.0:8080";
 
 /// Address the `healthcheck` subcommand probes.
 const HEALTHCHECK_ADDR: &str = "127.0.0.1:8080";
@@ -141,12 +139,15 @@ const CORS_ALLOWED_ORIGINS_ENV: &str = "CORS_ALLOWED_ORIGINS";
 
 /// Env var selecting the log output format; `json` enables structured logs.
 const LOG_FORMAT_ENV: &str = "LOG_FORMAT";
-
+const OTEL_EXPORTER_OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 /// OpenAPI description of the bounty read API (#865), served at
 /// `/api-docs/openapi.json` and rendered by the Swagger UI page (#866).
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "MergeMint backend API"),
+    info(
+        title = "MergeMint backend API",
+        description = "Rate-limited responses include X-RateLimit-Limit and X-RateLimit-Remaining; 429 responses include Retry-After in seconds."
+    ),
     paths(
         routes::bounties::list_bounties,
         routes::bounties::list_bounties_by_assignee,
@@ -214,12 +215,37 @@ async fn main() {
             .unwrap()
     });
 
+    let tracer = std::env::var(OTEL_EXPORTER_OTLP_ENDPOINT_ENV)
+        .ok()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .and_then(|endpoint| {
+            opentelemetry_otlp::new_pipeline()
+                .tracing()
+                .with_exporter(
+                    opentelemetry_otlp::new_exporter()
+                        .tonic()
+                        .with_endpoint(endpoint),
+                )
+                .install_batch(opentelemetry_sdk::runtime::Tokio)
+                .map_err(|error| {
+                    eprintln!("OpenTelemetry exporter setup failed: {error}");
+                    error
+                })
+                .ok()
+        });
     let registry = tracing_subscriber::registry().with(env_filter);
 
-    if log_format_is_json() {
-        registry.with(fmt::layer().json()).init();
-    } else {
-        registry.with(fmt::layer()).init();
+    match (log_format_is_json(), tracer) {
+        (true, Some(tracer)) => registry
+            .with(fmt::layer().json())
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .init(),
+        (false, Some(tracer)) => registry
+            .with(fmt::layer())
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .init(),
+        (true, None) => registry.with(fmt::layer().json()).init(),
+        (false, None) => registry.with(fmt::layer()).init(),
     }
 
     warn_if_reward_token_allowlist_empty();
@@ -255,6 +281,7 @@ async fn main() {
         .route("/tx/self-claim", post(self_claim))
         .route("/admin/audit-logs", get(query_audit_logs))
         .route("/bounties", get(list_bounties))
+        .route("/bounties/export.csv", get(export_bounties_csv))
         .route("/bounties/:id", get(get_bounty_route))
         .route(
             "/bounties/assignee/:address",
@@ -264,6 +291,7 @@ async fn main() {
         // ── Bounty push channel (#482) ─────────────────────────────────────
         .route("/bounties/:id/claim", post(claim_bounty))
         .route("/bounties/stream", get(bounty_stream))
+        .route("/feed.xml", get(open_bounties_feed))
         .route(
             "/webhooks/subscriptions",
             post(create_subscription_route).get(list_subscriptions_route),
@@ -286,6 +314,21 @@ async fn main() {
         // by the matched route and response status.
         .layer(middleware::from_fn_with_state(metrics, track_metrics))
         // ── Request correlation IDs (#486) ─────────────────────────────────
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+                let request_id = request
+                    .headers()
+                    .get(REQUEST_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing");
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    route = %request.uri().path(),
+                    request_id = %request_id,
+                )
+            }),
+        )
         .layer(PropagateRequestIdLayer::new(HeaderName::from_static(
             REQUEST_ID_HEADER,
         )))
@@ -294,7 +337,6 @@ async fn main() {
             MakeRequestUuid,
         ))
         // ── Tracing ────────────────────────────────────────────────────────
-        .layer(TraceLayer::new_for_http())
         // ── CORS ───────────────────────────────────────────────────────────
         .layer(cors_layer())
         // ── Body size limit (#476) ─────────────────────────────────────────
@@ -310,6 +352,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+    opentelemetry::global::shutdown_tracer_provider();
 }
 
 #[derive(Clone, Copy)]
@@ -437,6 +480,11 @@ fn cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([CONTENT_TYPE])
+        .expose_headers([
+            HeaderName::from_static("x-ratelimit-limit"),
+            HeaderName::from_static("x-ratelimit-remaining"),
+            HeaderName::from_static("retry-after"),
+        ])
         .allow_origin(AllowOrigin::list(allowed))
 }
 
